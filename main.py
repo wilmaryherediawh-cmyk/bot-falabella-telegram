@@ -9,7 +9,20 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 CHAT_ID = os.environ["CHAT_ID"]  # número (puede ser negativo si es grupo)
 
 WATCH_URLS = [
-    "https://www.falabella.com.pe/falabella-pe/collection/ofertas",
+   KEYWORDS = [
+    "niño",
+    "bebe",
+    "moda",
+    "juguete",
+    "belleza",
+    "calzado",
+    "accesorios mujer",
+]
+
+WATCH_URLS = [
+    "https://www.falabella.com.pe/falabella-pe/search?Ntt=" + requests.utils.quote(k)
+    for k in KEYWORDS
+
 ]
 
 THRESHOLD = 50  # >= 50%
