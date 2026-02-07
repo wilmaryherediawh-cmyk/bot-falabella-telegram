@@ -1,13 +1,25 @@
-name: Keep Alive
+name: Falabella Check (Manual)
 
 on:
-  schedule:
-    - cron: "*/10 * * * *"
   workflow_dispatch:
 
 jobs:
-  ping:
+  run:
     runs-on: ubuntu-latest
     steps:
-      - name: Ping Render App
-        run: curl -s https://TU_URL_DE_RENDER.onrender.com > /dev/null
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot check once
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python main.py
