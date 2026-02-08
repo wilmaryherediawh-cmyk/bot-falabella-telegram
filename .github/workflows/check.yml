@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   run:
@@ -26,15 +26,3 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python main.py
-
-      - name: Commit updated state.json (avoid repeats)
-        run: |
-          if git diff --quiet; then
-            echo "No changes to commit."
-          else
-            git config user.name "github-actions"
-            git config user.email "github-actions@github.com"
-            git add state.json
-            git commit -m "Update state.json"
-            git push
-          fi
