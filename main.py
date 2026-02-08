@@ -2,9 +2,9 @@ import os
 import re
 import json
 import time
-import math
 import random
 import logging
+import html as html_lib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import quote_plus, urljoin
@@ -12,13 +12,12 @@ from urllib.parse import quote_plus, urljoin
 import requests
 
 # ============================================================
-# Config (puedes ajustar)
+# Config
 # ============================================================
 
 BASE = "https://www.falabella.com.pe"
 SEARCH_URL = BASE + "/falabella-pe/search?Ntt={query}"
 
-# Palabras clave / categorías que quieres rastrear
 DEFAULT_KEYWORDS = [
     "niño",
     "bebe",
@@ -30,16 +29,13 @@ DEFAULT_KEYWORDS = [
 ]
 
 MIN_DISCOUNT_PERCENT = int(os.getenv("MIN_DISCOUNT_PERCENT", "50"))
-MAX_PRODUCTS_PER_KEYWORD = int(os.getenv("MAX_PRODUCTS_PER_KEYWORD", "30"))  # para no hacer demasiadas requests
+MAX_PRODUCTS_PER_KEYWORD = int(os.getenv("MAX_PRODUCTS_PER_KEYWORD", "30"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 STATE_FILE = "state.json"
 
-# Telegram
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
 
-# Opcional: sobreescribir keywords desde env (separadas por coma)
-# ejemplo: KEYWORDS="niño,bebe,moda"
 ENV_KEYWORDS = os.getenv("KEYWORDS", "").strip()
 
 # ============================================================
@@ -51,7 +47,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("falabella_bot")
-
 
 # ============================================================
 # Helpers
@@ -70,7 +65,6 @@ def _session() -> requests.Session:
 
 
 def load_state() -> Dict:
-    """state.json guarda links ya enviados para evitar repetidos."""
     if not os.path.exists(STATE_FILE):
         return {"sent": {}, "last_run": None}
     try:
@@ -82,12 +76,8 @@ def load_state() -> Dict:
 
 
 def save_state(state: Dict) -> None:
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        log.error(f"No pude guardar {STATE_FILE}: {e}")
-        raise
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
 
 
 def normalize_url(u: str) -> str:
@@ -100,7 +90,6 @@ def normalize_url(u: str) -> str:
 
 def sleep_a_bit() -> None:
     time.sleep(random.uniform(0.6, 1.4))
-
 
 # ============================================================
 # Telegram
@@ -122,9 +111,8 @@ def telegram_send(text: str) -> None:
     if not r.ok:
         raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
 
-
 # ============================================================
-# Scraping (busca productos por keyword y luego visita el producto)
+# Scraping
 # ============================================================
 
 @dataclass
@@ -139,9 +127,6 @@ class Product:
 _price_number_re = re.compile(r"(\d[\d\.,]+)")
 
 def _to_float_price(s: str) -> Optional[float]:
-    """
-    Convierte "1,299.90" o "1.299,90" o "1299" a float.
-    """
     if not s:
         return None
     s = s.strip()
@@ -150,16 +135,12 @@ def _to_float_price(s: str) -> Optional[float]:
         return None
     num = m.group(1)
 
-    # normaliza: si hay ambos separadores, asume el último como decimal
     if "," in num and "." in num:
         if num.rfind(",") > num.rfind("."):
-            # 1.299,90
             num = num.replace(".", "").replace(",", ".")
         else:
-            # 1,299.90
             num = num.replace(",", "")
     else:
-        # solo coma: puede ser decimal
         if "," in num and num.count(",") == 1 and len(num.split(",")[-1]) in (1, 2):
             num = num.replace(".", "").replace(",", ".")
         else:
@@ -172,23 +153,15 @@ def _to_float_price(s: str) -> Optional[float]:
 
 
 def extract_product_links_from_search(html: str) -> List[str]:
-    """
-    En Falabella, los links suelen verse como:
-    /falabella-pe/product/xxxxx/Nombre
-    """
     links = set(re.findall(r'href="(/falabella-pe/product/[^"]+)"', html))
-    # A veces hay links con \u002F en JS; intentamos también
     links |= set(re.findall(r'\"url\"\s*:\s*\"(\/falabella-pe\/product\/[^\"]+)\"', html))
-    out = [normalize_url(l) for l in links]
-    return out
+    return [normalize_url(l) for l in links]
 
 
 def extract_title(html: str) -> str:
-    # og:title suele funcionar
     m = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html)
     if m:
         return m.group(1).strip()
-    # fallback: <title>
     m = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE | re.DOTALL)
     if m:
         return re.sub(r"\s+", " ", m.group(1)).strip()
@@ -196,15 +169,9 @@ def extract_title(html: str) -> str:
 
 
 def extract_prices(html: str) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Intenta encontrar precio actual y precio anterior.
-    No hay un solo formato estable, así que probamos varias estrategias.
-    """
-    # Estrategia 1: JSON-like keys comunes
     candidates_now = []
     candidates_before = []
 
-    # claves que a veces aparecen
     for key in ["price", "bestPrice", "internetPrice", "salePrice", "currentPrice"]:
         for m in re.findall(rf'"{key}"\s*:\s*"?(.*?)"?(,|\}}|\])', html):
             val = _to_float_price(m[0])
@@ -217,27 +184,21 @@ def extract_prices(html: str) -> Tuple[Optional[float], Optional[float]]:
             if val:
                 candidates_before.append(val)
 
-    # Estrategia 2: meta itemprop price
     m = re.search(r'itemprop="price"\s+content="([^"]+)"', html)
     if m:
         val = _to_float_price(m.group(1))
         if val:
             candidates_now.append(val)
 
-    # Limpia y elige: precio actual = el menor valor razonable; antes = el mayor
-    # (porque lo normal es: antes > ahora)
     now = min(candidates_now) if candidates_now else None
     before = max(candidates_before) if candidates_before else None
 
-    # Si before no existe pero hay varios now, a veces el mayor es el "antes"
     if before is None and len(candidates_now) >= 2:
         sorted_vals = sorted(set(candidates_now))
         before = sorted_vals[-1]
         now = sorted_vals[0]
 
-    # Validación básica
     if now and before and before <= now:
-        # no tiene sentido, dejamos before como None
         before = None
 
     return now, before
@@ -261,13 +222,7 @@ def fetch_product(session: requests.Session, url: str) -> Product:
     now, before = extract_prices(html)
     disc = compute_discount(now, before)
 
-    return Product(
-        url=url,
-        title=title,
-        price_now=now,
-        price_before=before,
-        discount_pct=disc,
-    )
+    return Product(url=url, title=title, price_now=now, price_before=before, discount_pct=disc)
 
 
 def fetch_candidates(session: requests.Session, keyword: str) -> List[str]:
@@ -277,7 +232,6 @@ def fetch_candidates(session: requests.Session, keyword: str) -> List[str]:
     r.raise_for_status()
     links = extract_product_links_from_search(r.text)
 
-    # dedupe preservando orden
     seen = set()
     ordered = []
     for l in links:
@@ -289,14 +243,15 @@ def fetch_candidates(session: requests.Session, keyword: str) -> List[str]:
 
 
 def format_msg(p: Product) -> str:
-    # Mensaje estilo ofertas
+    safe_title = html_lib.escape(p.title)  # <-- CLAVE para Telegram HTML
+
     parts = []
     if p.discount_pct is not None:
         parts.append(f"🔥 <b>{p.discount_pct}% OFF</b>")
     else:
         parts.append("🔥 <b>OFERTA</b>")
 
-    parts.append(f"<b>{p.title}</b>")
+    parts.append(f"<b>{safe_title}</b>")
 
     if p.price_now and p.price_before:
         parts.append(f"💸 Ahora: <b>S/ {p.price_now:,.2f}</b>  |  Antes: S/ {p.price_before:,.2f}")
@@ -306,20 +261,18 @@ def format_msg(p: Product) -> str:
     parts.append(p.url)
     return "\n".join(parts)
 
-
 # ============================================================
 # Main
 # ============================================================
 
 def main():
-    # Keywords
     if ENV_KEYWORDS:
         keywords = [k.strip() for k in ENV_KEYWORDS.split(",") if k.strip()]
     else:
         keywords = DEFAULT_KEYWORDS
 
     state = load_state()
-    sent: Dict[str, Dict] = state.get("sent", {})  # url -> {ts, discount}
+    sent: Dict[str, Dict] = state.get("sent", {})
     sent_set: Set[str] = set(sent.keys())
 
     s = _session()
@@ -328,7 +281,6 @@ def main():
     total_found = 0
     total_sent = 0
 
-    # Recolecta URLs candidatas
     candidate_urls: List[str] = []
     for kw in keywords:
         try:
@@ -338,7 +290,6 @@ def main():
         except Exception as e:
             log.warning(f"Falló búsqueda para '{kw}': {e}")
 
-    # Dedupe global
     deduped = []
     seen = set()
     for u in candidate_urls:
@@ -348,7 +299,6 @@ def main():
 
     log.info(f"Total URLs candidatas (dedupe): {len(deduped)}")
 
-    # Visita productos, calcula descuento y manda a Telegram si aplica
     for url in deduped:
         total_checked += 1
 
@@ -358,19 +308,15 @@ def main():
 
             if p.discount_pct is None:
                 continue
-
             if p.discount_pct < MIN_DISCOUNT_PERCENT:
                 continue
 
             total_found += 1
 
-            # Anti repetidos
             if p.url in sent_set:
                 continue
 
-            # Envía
-            msg = format_msg(p)
-            telegram_send(msg)
+            telegram_send(format_msg(p))
             total_sent += 1
 
             sent[p.url] = {"ts": int(time.time()), "discount": p.discount_pct, "title": p.title}
@@ -381,7 +327,6 @@ def main():
         except Exception as e:
             log.warning(f"Error en producto {url}: {e}")
 
-    # Actualiza estado
     state["sent"] = sent
     state["last_run"] = int(time.time())
     save_state(state)
