@@ -7,36 +7,34 @@ import logging
 import html as html_lib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import quote_plus, urljoin
+from urllib.parse import urljoin
 
 import requests
 
 # ============================================================
-# Config (ajustable)
+# Config
 # ============================================================
 
 BASE = "https://www.falabella.com.pe"
-SEARCH_URL = BASE + "/falabella-pe/search?Ntt={query}"
 
-DEFAULT_KEYWORDS = [
-    "niño",
-    "bebe",
-    "moda",
-    "juguete",
-    "belleza",
-    "calzado",
-    "accesorios mujer",
+# Tus categorías (Saga/Falabella)
+DEFAULT_CATEGORY_URLS = [
+    "https://www.falabella.com.pe/falabella-pe/category/CATG12023/Mujer?f.derived.variant.sellerId=FALABELLA",
+    "https://www.falabella.com.pe/falabella-pe/category/cat40498/Belleza--higiene-y-salud?f.derived.variant.sellerId=FALABELLA",
+    "https://www.falabella.com.pe/falabella-pe/category/CATG33544/Ninos-y-Jugueteria?f.derived.variant.sellerId=FALABELLA",
 ]
 
+# Puedes sobreescribir por env:
+# CATEGORY_URLS="url1,url2,url3"
+ENV_CATEGORY_URLS = os.getenv("CATEGORY_URLS", "").strip()
+
 MIN_DISCOUNT_PERCENT = int(os.getenv("MIN_DISCOUNT_PERCENT", "50"))
-MAX_PRODUCTS_PER_KEYWORD = int(os.getenv("MAX_PRODUCTS_PER_KEYWORD", "30"))
+MAX_PRODUCTS_PER_CATEGORY = int(os.getenv("MAX_PRODUCTS_PER_CATEGORY", "120"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 STATE_FILE = "state.json"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
-
-ENV_KEYWORDS = os.getenv("KEYWORDS", "").strip()
 
 # ============================================================
 # Logging
@@ -47,7 +45,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("falabella_bot")
-
 
 # ============================================================
 # Helpers
@@ -64,6 +61,7 @@ def _session() -> requests.Session:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
+        "Referer": BASE + "/falabella-pe",
     })
     return s
 
@@ -85,10 +83,7 @@ def save_state(state: Dict) -> None:
 
 
 def normalize_url(u: str) -> str:
-    u = u.strip()
-    # des-escapar cosas tipo \/falabella-pe\/product\/...
-    u = u.replace("\\/", "/")
-
+    u = u.strip().replace("\\/", "/")
     if u.startswith("//"):
         return "https:" + u
     if u.startswith("/"):
@@ -97,8 +92,7 @@ def normalize_url(u: str) -> str:
 
 
 def sleep_a_bit() -> None:
-    time.sleep(random.uniform(0.6, 1.4))
-
+    time.sleep(random.uniform(0.5, 1.1))
 
 # ============================================================
 # Telegram
@@ -120,7 +114,6 @@ def telegram_send(text: str) -> None:
     if not r.ok:
         raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
 
-
 # ============================================================
 # Scraping
 # ============================================================
@@ -135,6 +128,7 @@ class Product:
 
 
 _price_number_re = re.compile(r"(\d[\d\.,]+)")
+
 
 def _to_float_price(s: str) -> Optional[float]:
     if not s:
@@ -162,13 +156,10 @@ def _to_float_price(s: str) -> Optional[float]:
         return None
 
 
-def extract_product_links_from_search(html: str) -> List[str]:
+def extract_product_links_from_listing(html: str) -> List[str]:
     """
-    Falabella a veces renderiza distinto:
-    - href="/falabella-pe/product/..."
-    - href='...'
-    - url:"\/falabella-pe\/product\/..."
-    - URL completa https://www.falabella.com.pe/falabella-pe/product/...
+    Extrae links de productos desde HTML de categoría/listado.
+    Falabella puede renderizar distinto, así que usamos varios patrones.
     """
     patterns = [
         r'href="(/falabella-pe/product/[^"]+)"',
@@ -177,29 +168,19 @@ def extract_product_links_from_search(html: str) -> List[str]:
         r"href='(https?://www\.falabella\.com\.pe/falabella-pe/product/[^']+)'",
         r'"url"\s*:\s*"((?:\\\/|\/)falabella-pe(?:\\\/|\/)product(?:\\\/|\/)[^"]+)"',
         r'"linkTo"\s*:\s*"((?:\\\/|\/)falabella-pe(?:\\\/|\/)product(?:\\\/|\/)[^"]+)"',
-        r'(https?://www\.falabella\.com\.pe/falabella-pe/product/\d+/[^\s"\'<>]+)',
     ]
 
-    links: Set[str] = set()
+    links: List[str] = []
+    seen: Set[str] = set()
+
     for pat in patterns:
         for m in re.findall(pat, html):
-            links.add(normalize_url(m))
+            u = normalize_url(m)
+            if "/falabella-pe/product/" in u and u not in seen:
+                seen.add(u)
+                links.append(u)
 
-    # filtra cosas raras (como /falabella-pe/product/ algo incompleto)
-    clean = []
-    for l in links:
-        if "/falabella-pe/product/" in l:
-            clean.append(l)
-
-    # dedupe preservando orden
-    seen = set()
-    ordered = []
-    for l in clean:
-        if l not in seen:
-            seen.add(l)
-            ordered.append(l)
-
-    return ordered
+    return links
 
 
 def extract_title(html: str) -> str:
@@ -213,20 +194,20 @@ def extract_title(html: str) -> str:
 
 
 def extract_discount_from_html(html: str) -> Optional[int]:
+    # -70%
     m = re.search(r"-\s*(\d{1,2})\s*%", html)
     if m:
         try:
             return int(m.group(1))
         except Exception:
             return None
-
+    # 70% OFF
     m = re.search(r"(\d{1,2})\s*%\s*OFF", html, re.IGNORECASE)
     if m:
         try:
             return int(m.group(1))
         except Exception:
             return None
-
     return None
 
 
@@ -234,7 +215,7 @@ def extract_prices(html: str) -> Tuple[Optional[float], Optional[float]]:
     candidates_now: List[float] = []
     candidates_before: List[float] = []
 
-    # JSON-like keys (cuando existan)
+    # JSON-like keys
     for key in ["price", "bestPrice", "internetPrice", "salePrice", "currentPrice"]:
         for m in re.findall(rf'"{key}"\s*:\s*"?(.*?)"?(,|\}}|\])', html):
             val = _to_float_price(m[0])
@@ -247,14 +228,14 @@ def extract_prices(html: str) -> Tuple[Optional[float], Optional[float]]:
             if val:
                 candidates_before.append(val)
 
-    # meta itemprop price
+    # itemprop
     m = re.search(r'itemprop="price"\s+content="([^"]+)"', html)
     if m:
         val = _to_float_price(m.group(1))
         if val:
             candidates_now.append(val)
 
-    # fallback: "S/ 11.97" (como tu ejemplo)
+    # fallback "S/ 11.97"
     soles = []
     for m in re.findall(r"S/\s*([\d\.,]+)", html):
         val = _to_float_price(m)
@@ -300,19 +281,13 @@ def fetch_product(session: requests.Session, url: str) -> Product:
     return Product(url=url, title=title, price_now=now, price_before=before, discount_pct=disc)
 
 
-def fetch_candidates(session: requests.Session, keyword: str) -> List[str]:
-    url = SEARCH_URL.format(query=quote_plus(keyword))
-    log.info(f"Buscando keyword: {keyword} -> {url}")
-
-    # a veces ayuda mandar un referer
-    headers = {"Referer": BASE + "/falabella-pe"}
-    r = session.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+def fetch_category_products(session: requests.Session, category_url: str) -> List[str]:
+    log.info(f"Categoría: {category_url}")
+    r = session.get(category_url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
-
-    links = extract_product_links_from_search(r.text)
-    log.info(f"Links encontrados para '{keyword}': {len(links)}")
-
-    return links[:MAX_PRODUCTS_PER_KEYWORD]
+    links = extract_product_links_from_listing(r.text)
+    log.info(f"Links de producto encontrados en categoría: {len(links)}")
+    return links[:MAX_PRODUCTS_PER_CATEGORY]
 
 
 def format_msg(p: Product) -> str:
@@ -334,16 +309,15 @@ def format_msg(p: Product) -> str:
     parts.append(f"🔗 {p.url}")
     return "\n".join(parts)
 
-
 # ============================================================
 # Main
 # ============================================================
 
 def main():
-    if ENV_KEYWORDS:
-        keywords = [k.strip() for k in ENV_KEYWORDS.split(",") if k.strip()]
+    if ENV_CATEGORY_URLS:
+        category_urls = [u.strip() for u in ENV_CATEGORY_URLS.split(",") if u.strip()]
     else:
-        keywords = DEFAULT_KEYWORDS
+        category_urls = DEFAULT_CATEGORY_URLS
 
     state = load_state()
     sent: Dict[str, Dict] = state.get("sent", {})
@@ -351,32 +325,32 @@ def main():
 
     s = _session()
 
-    candidate_urls: List[str] = []
-    per_kw_counts = {}
+    # 1) Traer links de productos por categoría
+    all_candidate_urls: List[str] = []
+    per_cat_count: Dict[str, int] = {}
 
-    for kw in keywords:
+    for cu in category_urls:
         try:
-            urls = fetch_candidates(s, kw)
-            per_kw_counts[kw] = len(urls)
-            candidate_urls.extend(urls)
+            urls = fetch_category_products(s, cu)
+            per_cat_count[cu] = len(urls)
+            all_candidate_urls.extend(urls)
             sleep_a_bit()
         except Exception as e:
-            per_kw_counts[kw] = 0
-            log.warning(f"Falló búsqueda para '{kw}': {e}")
+            per_cat_count[cu] = 0
+            log.warning(f"Falló categoría {cu}: {e}")
 
-    # Debug útil: si no hay productos, te avisamos por Telegram
-    if not candidate_urls:
-        msg = "⚠️ El bot corrió, pero Falabella devolvió 0 productos en SEARCH.\n\n"
-        msg += "Conteo por keyword:\n"
-        for kw, c in per_kw_counts.items():
-            msg += f"• {kw}: {c}\n"
+    # Si no hay nada, avisamos (para debug)
+    if not all_candidate_urls:
+        msg = "⚠️ El bot corrió, pero Falabella devolvió 0 productos en las categorías.\n"
+        for cu, c in per_cat_count.items():
+            msg += f"\n• {cu} -> {c}"
         telegram_send(msg)
         return
 
     # Dedupe global
-    deduped = []
-    seen = set()
-    for u in candidate_urls:
+    deduped: List[str] = []
+    seen: Set[str] = set()
+    for u in all_candidate_urls:
         if u not in seen:
             seen.add(u)
             deduped.append(u)
@@ -387,13 +361,16 @@ def main():
     total_found = 0
     total_sent = 0
 
+    # 2) Visitar productos y enviar si >= 50%
     for url in deduped:
         total_checked += 1
         try:
             p = fetch_product(s, url)
             sleep_a_bit()
 
-            if p.discount_pct is None or p.discount_pct < MIN_DISCOUNT_PERCENT:
+            if p.discount_pct is None:
+                continue
+            if p.discount_pct < MIN_DISCOUNT_PERCENT:
                 continue
 
             total_found += 1
