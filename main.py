@@ -7,7 +7,7 @@ import logging
 import html as html_lib
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode, urlunparse
 
 import requests
 
@@ -17,21 +17,22 @@ import requests
 
 BASE = "https://www.falabella.com.pe"
 
-# Tus categorías (Saga/Falabella)
 DEFAULT_CATEGORY_URLS = [
     "https://www.falabella.com.pe/falabella-pe/category/CATG12023/Mujer?f.derived.variant.sellerId=FALABELLA",
     "https://www.falabella.com.pe/falabella-pe/category/cat40498/Belleza--higiene-y-salud?f.derived.variant.sellerId=FALABELLA",
     "https://www.falabella.com.pe/falabella-pe/category/CATG33544/Ninos-y-Jugueteria?f.derived.variant.sellerId=FALABELLA",
 ]
 
-# Puedes sobreescribir por env:
-# CATEGORY_URLS="url1,url2,url3"
 ENV_CATEGORY_URLS = os.getenv("CATEGORY_URLS", "").strip()
 
 MIN_DISCOUNT_PERCENT = int(os.getenv("MIN_DISCOUNT_PERCENT", "50"))
-MAX_PRODUCTS_PER_CATEGORY = int(os.getenv("MAX_PRODUCTS_PER_CATEGORY", "120"))
+MAX_PRODUCTS_PER_CATEGORY = int(os.getenv("MAX_PRODUCTS_PER_CATEGORY", "200"))
+MAX_PAGES_PER_CATEGORY = int(os.getenv("MAX_PAGES_PER_CATEGORY", "6"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 STATE_FILE = "state.json"
+
+# Si pones RESET_STATE=1 en Variables/Secrets, limpia el historial de enviados
+RESET_STATE = os.getenv("RESET_STATE", "0").strip() == "1"
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
@@ -92,7 +93,27 @@ def normalize_url(u: str) -> str:
 
 
 def sleep_a_bit() -> None:
-    time.sleep(random.uniform(0.5, 1.1))
+    time.sleep(random.uniform(0.7, 1.4))
+
+
+def looks_blocked(html: str) -> bool:
+    h = html.lower()
+    bad_signals = [
+        "captcha", "robot", "access denied", "temporarily blocked",
+        "unusual traffic", "verify you are human"
+    ]
+    return any(x in h for x in bad_signals)
+
+def with_page_param(url: str, page: int) -> str:
+    """
+    Falabella suele aceptar page=2 en categorías.
+    Construimos la URL sin romper los parámetros existentes.
+    """
+    p = urlparse(url)
+    q = parse_qs(p.query)
+    q["page"] = [str(page)]
+    new_query = urlencode(q, doseq=True)
+    return urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, p.fragment))
 
 # ============================================================
 # Telegram
@@ -139,6 +160,7 @@ def _to_float_price(s: str) -> Optional[float]:
         return None
     num = m.group(1)
 
+    # normalización de separadores
     if "," in num and "." in num:
         if num.rfind(",") > num.rfind("."):
             num = num.replace(".", "").replace(",", ".")
@@ -157,10 +179,6 @@ def _to_float_price(s: str) -> Optional[float]:
 
 
 def extract_product_links_from_listing(html: str) -> List[str]:
-    """
-    Extrae links de productos desde HTML de categoría/listado.
-    Falabella puede renderizar distinto, así que usamos varios patrones.
-    """
     patterns = [
         r'href="(/falabella-pe/product/[^"]+)"',
         r"href='(/falabella-pe/product/[^']+)'",
@@ -194,20 +212,30 @@ def extract_title(html: str) -> str:
 
 
 def extract_discount_from_html(html: str) -> Optional[int]:
-    # -70%
-    m = re.search(r"-\s*(\d{1,2})\s*%", html)
+    # -70% / - 70 %
+    m = re.search(r"-\s*(\d{1,3})\s*%", html)
     if m:
         try:
             return int(m.group(1))
         except Exception:
             return None
+
     # 70% OFF
-    m = re.search(r"(\d{1,2})\s*%\s*OFF", html, re.IGNORECASE)
+    m = re.search(r"(\d{1,3})\s*%\s*OFF", html, re.IGNORECASE)
     if m:
         try:
             return int(m.group(1))
         except Exception:
             return None
+
+    # DSCTO / DESCUENTO
+    m = re.search(r"(\d{1,3})\s*%\s*(?:DSCTO|DESCUENTO)", html, re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+
     return None
 
 
@@ -215,8 +243,7 @@ def extract_prices(html: str) -> Tuple[Optional[float], Optional[float]]:
     candidates_now: List[float] = []
     candidates_before: List[float] = []
 
-    # JSON-like keys
-    for key in ["price", "bestPrice", "internetPrice", "salePrice", "currentPrice"]:
+    for key in ["bestPrice", "internetPrice", "salePrice", "currentPrice", "price"]:
         for m in re.findall(rf'"{key}"\s*:\s*"?(.*?)"?(,|\}}|\])', html):
             val = _to_float_price(m[0])
             if val:
@@ -228,14 +255,13 @@ def extract_prices(html: str) -> Tuple[Optional[float], Optional[float]]:
             if val:
                 candidates_before.append(val)
 
-    # itemprop
     m = re.search(r'itemprop="price"\s+content="([^"]+)"', html)
     if m:
         val = _to_float_price(m.group(1))
         if val:
             candidates_now.append(val)
 
-    # fallback "S/ 11.97"
+    # fallback S/
     soles = []
     for m in re.findall(r"S/\s*([\d\.,]+)", html):
         val = _to_float_price(m)
@@ -271,6 +297,9 @@ def fetch_product(session: requests.Session, url: str) -> Product:
     r.raise_for_status()
     html = r.text
 
+    if looks_blocked(html):
+        raise RuntimeError("Falabella devolvió HTML tipo bloqueo/captcha.")
+
     title = extract_title(html)
     now, before = extract_prices(html)
 
@@ -283,11 +312,37 @@ def fetch_product(session: requests.Session, url: str) -> Product:
 
 def fetch_category_products(session: requests.Session, category_url: str) -> List[str]:
     log.info(f"Categoría: {category_url}")
-    r = session.get(category_url, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    links = extract_product_links_from_listing(r.text)
-    log.info(f"Links de producto encontrados en categoría: {len(links)}")
-    return links[:MAX_PRODUCTS_PER_CATEGORY]
+
+    all_links: List[str] = []
+    seen: Set[str] = set()
+
+    for page in range(1, MAX_PAGES_PER_CATEGORY + 1):
+        page_url = category_url if page == 1 else with_page_param(category_url, page)
+        r = session.get(page_url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+
+        if looks_blocked(r.text):
+            log.warning(f"Posible bloqueo en categoría (page {page}).")
+            break
+
+        links = extract_product_links_from_listing(r.text)
+        log.info(f"Page {page} -> links: {len(links)}")
+
+        if not links and page > 1:
+            break
+
+        for u in links:
+            if u not in seen:
+                seen.add(u)
+                all_links.append(u)
+
+        if len(all_links) >= MAX_PRODUCTS_PER_CATEGORY:
+            break
+
+        sleep_a_bit()
+
+    log.info(f"Links totales acumulados en categoría: {len(all_links)}")
+    return all_links[:MAX_PRODUCTS_PER_CATEGORY]
 
 
 def format_msg(p: Product) -> str:
@@ -295,16 +350,16 @@ def format_msg(p: Product) -> str:
 
     parts = []
     if p.discount_pct is not None:
-        parts.append(f"⚡ <b>{p.discount_pct}% OFF</b>")
+        parts.append(f"🍄 <b>{p.discount_pct}% OFF</b>")
     else:
-        parts.append("⚡ <b>OFERTA</b>")
+        parts.append("🍄 <b>OFERTA</b>")
 
     parts.append(f"🛍️ <b>{safe_title}</b>")
 
     if p.price_now and p.price_before:
-        parts.append(f"💰 Ahora: <b>S/ {p.price_now:,.2f}</b>  |  Antes: S/ {p.price_before:,.2f}")
+        parts.append(f"💰 Ahora: <b>S/ {p.price_now:.2f}</b> | Antes: S/ {p.price_before:.2f}")
     elif p.price_now:
-        parts.append(f"💰 Precio: <b>S/ {p.price_now:,.2f}</b>")
+        parts.append(f"💰 Precio: <b>S/ {p.price_now:.2f}</b>")
 
     parts.append(f"🔗 {p.url}")
     return "\n".join(parts)
@@ -320,12 +375,16 @@ def main():
         category_urls = DEFAULT_CATEGORY_URLS
 
     state = load_state()
+
+    if RESET_STATE:
+        log.warning("RESET_STATE=1 -> limpiando historial de enviados.")
+        state["sent"] = {}
+
     sent: Dict[str, Dict] = state.get("sent", {})
     sent_set: Set[str] = set(sent.keys())
 
     s = _session()
 
-    # 1) Traer links de productos por categoría
     all_candidate_urls: List[str] = []
     per_cat_count: Dict[str, int] = {}
 
@@ -339,9 +398,8 @@ def main():
             per_cat_count[cu] = 0
             log.warning(f"Falló categoría {cu}: {e}")
 
-    # Si no hay nada, avisamos (para debug)
     if not all_candidate_urls:
-        msg = "⚠️ El bot corrió, pero Falabella devolvió 0 productos en las categorías.\n"
+        msg = "⚠️ El bot corrió, pero Falabella devolvió 0 productos.\n"
         for cu, c in per_cat_count.items():
             msg += f"\n• {cu} -> {c}"
         telegram_send(msg)
@@ -360,17 +418,15 @@ def main():
     total_checked = 0
     total_found = 0
     total_sent = 0
+    blocked_hits = 0
 
-    # 2) Visitar productos y enviar si >= 50%
     for url in deduped:
         total_checked += 1
         try:
             p = fetch_product(s, url)
             sleep_a_bit()
 
-            if p.discount_pct is None:
-                continue
-            if p.discount_pct < MIN_DISCOUNT_PERCENT:
+            if p.discount_pct is None or p.discount_pct < MIN_DISCOUNT_PERCENT:
                 continue
 
             total_found += 1
@@ -387,8 +443,11 @@ def main():
             log.info(f"Enviado: {p.discount_pct}% | {p.title}")
 
         except Exception as e:
+            if "bloqueo" in str(e).lower() or "captcha" in str(e).lower():
+                blocked_hits += 1
             log.warning(f"Error en producto {url}: {e}")
 
+    # Guardar estado
     state["sent"] = sent
     state["last_run"] = int(time.time())
     save_state(state)
@@ -397,7 +456,19 @@ def main():
     log.info(f"Revisados: {total_checked}")
     log.info(f"Con descuento >= {MIN_DISCOUNT_PERCENT}%: {total_found}")
     log.info(f"Enviados a Telegram: {total_sent}")
+    log.info(f"Posibles bloqueos: {blocked_hits}")
     log.info("======================================")
+
+    # ✅ Resumen a Telegram para que NUNCA quede silencioso
+    resumen = (
+        f"🍄 <b>Resumen del scan</b>\n"
+        f"📦 Revisados: <b>{total_checked}</b>\n"
+        f"🔥 Ofertas >= {MIN_DISCOUNT_PERCENT}%: <b>{total_found}</b>\n"
+        f"📨 Enviados nuevos: <b>{total_sent}</b>\n"
+        f"🧱 Posibles bloqueos: <b>{blocked_hits}</b>\n"
+        f"🕒 {time.strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    telegram_send(resumen)
 
 
 if __name__ == "__main__":
