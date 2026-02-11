@@ -1,28 +1,10 @@
-name: Falabella Check (Manual)
-
-on:
-  workflow_dispatch:
-
-permissions:
-  contents: read
-
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run check
-        env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-        run: python main.py
+- name: Run bot
+  env:
+    BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+    CHAT_ID: ${{ secrets.CHAT_ID }}
+    CATEGORY_URLS: ${{ vars.CATEGORY_URLS }}
+    MIN_DISCOUNT_PERCENT: ${{ vars.MIN_DISCOUNT_PERCENT }}
+    MAX_PAGES_PER_CATEGORY: ${{ vars.MAX_PAGES_PER_CATEGORY }}
+    REQUEST_TIMEOUT: ${{ vars.REQUEST_TIMEOUT }}
+  run: |
+    python main.py
